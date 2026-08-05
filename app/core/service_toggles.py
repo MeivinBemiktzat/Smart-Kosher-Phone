@@ -6,9 +6,10 @@ ServiceToggles — ניהול מצב הפעלה/כיבוי לכל לשונית �
 המצב נשמר ל-settings.json ונטען מחדש בכל הפעלה.
 """
 
-import json
 import os
 from PyQt6.QtCore import QObject, pyqtSignal as Signal
+
+from app.core.safe_json_io import atomic_write_json, load_json
 
 SETTINGS_PATH = os.path.join(
     os.path.expanduser("~"), "BluePhone", "settings.json")
@@ -22,18 +23,11 @@ TOGGLABLE_PAGES = [
 
 
 def _load() -> dict:
-    try:
-        if os.path.exists(SETTINGS_PATH):
-            return json.loads(open(SETTINGS_PATH, encoding="utf-8").read())
-    except Exception:
-        pass
-    return {}
+    return load_json(SETTINGS_PATH, {})
 
 
 def _save(data: dict):
-    os.makedirs(os.path.dirname(SETTINGS_PATH), exist_ok=True)
-    open(SETTINGS_PATH, "w", encoding="utf-8").write(
-        json.dumps(data, ensure_ascii=False, indent=2))
+    atomic_write_json(SETTINGS_PATH, data)
 
 
 class ServiceToggles(QObject):
