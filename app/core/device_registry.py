@@ -17,10 +17,11 @@ DeviceRegistry — ניהול רשימת מכשירי בלוטוס מוכרים 
 וניתן להחליף בקלות איזה מהם פעיל.
 """
 
-import json
 import os
 from dataclasses import dataclass, field
 from typing import Optional
+
+from app.core.safe_json_io import atomic_write_json, load_json
 
 SETTINGS_PATH = os.path.join(
     os.path.expanduser("~"), "BluePhone", "settings.json")
@@ -36,18 +37,11 @@ class KnownDevice:
 
 
 def _load() -> dict:
-    try:
-        if os.path.exists(SETTINGS_PATH):
-            return json.loads(open(SETTINGS_PATH, encoding="utf-8").read())
-    except Exception:
-        pass
-    return {}
+    return load_json(SETTINGS_PATH, {})
 
 
 def _save(data: dict):
-    os.makedirs(os.path.dirname(SETTINGS_PATH), exist_ok=True)
-    open(SETTINGS_PATH, "w", encoding="utf-8").write(
-        json.dumps(data, ensure_ascii=False, indent=2))
+    atomic_write_json(SETTINGS_PATH, data)
 
 
 class DeviceRegistry:
@@ -62,13 +56,17 @@ class DeviceRegistry:
     def _load(self):
         data = _load()
         for addr, d in data.get("known_devices", {}).items():
-            self._devices[addr] = KnownDevice(
-                address=addr,
-                custom_name=d.get("custom_name", ""),
-                phone_number=d.get("phone_number", ""),
-                is_primary=d.get("is_primary", False),
-                last_connected=d.get("last_connected", 0.0),
-            )
+            try:
+                self._devices[addr] = KnownDevice(
+                    address=addr,
+                    custom_name=d.get("custom_name", ""),
+                    phone_number=d.get("phone_number", ""),
+                    is_primary=d.get("is_primary", False),
+                    last_connected=d.get("last_connected", 0.0),
+                )
+            except Exception:
+                # רשומה בודדת פגומה לא תפיל את כל רשימת המכשירים
+                continue
 
     def _persist(self):
         data = _load()
