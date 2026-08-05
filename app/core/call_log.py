@@ -5,13 +5,15 @@ CallLog - יומן שיחות
 שמירה והצגת היסטוריית שיחות
 """
 
-import json
+import csv
 import time
 import datetime
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Optional
 from PyQt6.QtCore import QObject, pyqtSignal as Signal
+
+from app.core.safe_json_io import atomic_write_json, load_json
 
 
 @dataclass
@@ -95,22 +97,23 @@ class CallLog(QObject):
         self._load()
 
     def _load(self):
-        if self._path.exists():
+        data = load_json(str(self._path), {})
+        entries = []
+        for e in data.get("entries", []):
             try:
-                data = json.loads(self._path.read_text(encoding="utf-8"))
-                self._entries = [CallLogEntry(**e) for e in data.get("entries", [])]
-                self._blacklist = set(data.get("blacklist", []))
+                entries.append(CallLogEntry(**e))
             except Exception:
-                self._entries = []
+                # רשומה בודדת פגומה (למשל משדה חסר בגרסה ישנה) לא
+                # תגרום לאיבוד כל יומן השיחות — פשוט מדלגים עליה
+                continue
+        self._entries = entries
+        self._blacklist = set(data.get("blacklist", []))
 
     def _save(self):
-        try:
-            self._path.write_text(json.dumps({
-                "entries":   [asdict(e) for e in self._entries],
-                "blacklist": list(self._blacklist),
-            }, ensure_ascii=False, indent=2), encoding="utf-8")
-        except Exception:
-            pass
+        atomic_write_json(str(self._path), {
+            "entries":   [asdict(e) for e in self._entries],
+            "blacklist": list(self._blacklist),
+        })
 
     # ── API ──────────────────────────────────────────────
 
@@ -155,3 +158,33 @@ class CallLog(QObject):
 
     def is_blacklisted(self, number: str) -> bool:
         return number in self._blacklist
+
+    # ── Export ───────────────────────────────────────────
+
+    def export_csv(self, file_path: str, direction: str = "",
+                    is_rtl: bool = True) -> bool:
+        """מייצא את יומן השיחות (מסונן לפי direction אם צויין) לקובץ CSV.
+        מחזיר True בהצלחה, False בכישלון (לא זורק חריגה)."""
+        entries = self.get_filtered(direction)
+        headers = (
+            ["שם", "מספר", "כיוון", "תאריך ושעה", "משך (שניות)", "נענתה"]
+            if is_rtl else
+            ["Name", "Number", "Direction", "Date & Time", "Duration (s)", "Answered"]
+        )
+        try:
+            with open(file_path, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.writer(f)
+                writer.writerow(headers)
+                for e in entries:
+                    writer.writerow([
+                        e.name,
+                        e.number,
+                        e.direction_label_for(is_rtl),
+                        e.start_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                        int(e.duration),
+                        "כן" if is_rtl and e.answered else
+                        ("Yes" if e.answered else ("לא" if is_rtl else "No")),
+                    ])
+            return True
+        except Exception:
+            return False
