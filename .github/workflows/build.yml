@@ -1,17 +1,27 @@
 name: Build & Release EXE
 
 # מתי הריצה מופעלת:
-#   1. אוטומטית — בכל פעם שדוחפים tag שמתחיל ב-v (למשל v1.0, v1.1)
-#   2. ידנית — דרך הכפתור "Run workflow" בלשונית Actions בגיטהאב
+#   1. אוטומטית — בכל פעם שדוחפים tag שמתחיל ב-v
+#      לדוגמה: v1.0.0
+#
+#   2. ידנית — דרך הכפתור "Run workflow"
+#      במקרה כזה ייווצר Tag אוטומטי לפי תאריך ושעה,
+#      לדוגמה: v2026.08.05-2200
 
 on:
   push:
     tags:
       - "v*"
+
   workflow_dispatch: {}
 
+# הרשאות הנדרשות:
+# contents: write מאפשרות ל-Workflow:
+# - ליצור Tag
+# - ליצור Release
+# - להעלות קבצים ל-Release
 permissions:
-  contents: write   # נדרש כדי ליצור/לעדכן Release ולהעלות אליו קבצים
+  contents: write
 
 jobs:
   build:
@@ -19,21 +29,64 @@ jobs:
     runs-on: windows-latest
 
     steps:
+
+      # ============================================================
+      # שלב 1 — הורדת קוד הפרויקט
+      # ============================================================
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # ============================================================
+      # שלב 2 — התקנת Python
+      # ============================================================
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
+      # ============================================================
+      # שלב 3 — התקנת תלויות
+      # ============================================================
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install pyinstaller
 
+      # ============================================================
+      # שלב 4 — קביעת Tag עבור ה-Release
+      #
+      # אם ה-Workflow הופעל באמצעות Tag:
+      #     משתמשים ב-Tag הקיים.
+      #
+      # אם הופעל ידנית:
+      #     יוצרים Tag אוטומטי לפי תאריך ושעה.
+      #
+      # לדוגמה:
+      #     v2026.08.05-2200
+      # ============================================================
+      - name: Determine release tag
+        id: release_tag
+        shell: pwsh
+        run: |
+          if ("${{ github.ref }}".StartsWith("refs/tags/v")) {
+              $tag = "${{ github.ref_name }}"
+              Write-Host "Workflow was triggered by existing tag: $tag"
+          }
+          else {
+              $date = Get-Date -Format "yyyy.MM.dd-HHmm"
+              $tag = "v$date"
+              Write-Host "Workflow was triggered manually."
+              Write-Host "Generated release tag: $tag"
+          }
+
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      # ============================================================
+      # שלב 5 — Build
+      # ============================================================
       - name: Build EXE with PyInstaller
+        shell: pwsh
         run: |
           pyinstaller --onefile --windowed --name SmartKosherPhone `
             --add-data "app\style_light.qss;app" `
@@ -50,16 +103,27 @@ jobs:
             --icon app\resources\icon.ico `
             main.py
 
+      # ============================================================
+      # שלב 6 — בדיקה שה-EXE באמת נוצר
+      # ============================================================
       - name: Verify build output
-        shell: bash
+        shell: pwsh
         run: |
-          if [ ! -f "dist/SmartKosherPhone.exe" ]; then
-            echo "::error::Build failed — SmartKosherPhone.exe not found in dist/"
-            exit 1
-          fi
-          echo "Build succeeded:"
-          ls -la dist/
+          if (-not (Test-Path "dist\SmartKosherPhone.exe")) {
+              Write-Error "Build failed — SmartKosherPhone.exe not found in dist\"
+              exit 1
+          }
 
+          Write-Host "Build succeeded!"
+          Write-Host ""
+          Write-Host "Build output:"
+          Get-ChildItem "dist"
+
+      # ============================================================
+      # שלב 7 — העלאה ל-Artifacts
+      #
+      # זה מאפשר לשמור את הקובץ גם בתוך הרצת ה-Workflow.
+      # ============================================================
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
@@ -67,9 +131,25 @@ jobs:
           path: dist/SmartKosherPhone.exe
           if-no-files-found: error
 
+      # ============================================================
+      # שלב 8 — יצירת GitHub Release
+      #
+      # בשלב הזה:
+      #
+      # אם היה Tag:
+      #     משתמשים ב-Tag הקיים.
+      #
+      # אם ההרצה הייתה ידנית:
+      #     משתמשים ב-Tag שנוצר אוטומטית.
+      #
+      # ה-EXE שנוצר באותה הרצה מועלה ישירות ל-Release.
+      # ============================================================
       - name: Publish to GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.release_tag.outputs.tag }}
+          name: SmartKosherPhone ${{ steps.release_tag.outputs.tag }}
           files: dist/SmartKosherPhone.exe
           generate_release_notes: true
+          draft: false
+          prerelease: false
