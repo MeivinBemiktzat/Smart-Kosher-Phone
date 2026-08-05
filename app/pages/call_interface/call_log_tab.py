@@ -2,10 +2,14 @@
 # -*- coding: utf-8 -*-
 """לשונית יומן שיחות — תת-לשוניות לסינון"""
 
+import os
+import datetime
+
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QListWidget, QListWidgetItem,
-    QTabWidget, QFrame, QMessageBox, QLineEdit, QSizePolicy
+    QTabWidget, QFrame, QMessageBox, QLineEdit, QSizePolicy,
+    QFileDialog
 )
 from PyQt6.QtCore import Qt, QSize, pyqtSignal as Signal
 from PyQt6.QtGui import QFont
@@ -114,6 +118,12 @@ class LogListWidget(QWidget, Translatable):
         self._btn_bl.setCursor(Qt.CursorShape.PointingHandCursor)
         self._btn_bl.clicked.connect(self._blacklist_selected)
         ar.addWidget(self._btn_bl)
+        self._btn_export = QPushButton()
+        self.tr_set(self._btn_export, "📤  ייצוא ל-CSV", "📤  Export CSV")
+        self._btn_export.setObjectName("secondaryButton")
+        self._btn_export.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_export.clicked.connect(self._export_csv)
+        ar.addWidget(self._btn_export)
         ly.addLayout(ar)
 
     def retranslate(self):
@@ -156,6 +166,35 @@ class LogListWidget(QWidget, Translatable):
             if w and hasattr(w, 'entry'):
                 self._log.add_to_blacklist(w.entry.number)
                 self.refresh()
+
+    def _export_csv(self):
+        is_rtl = self._lang_mgr.is_rtl
+        default_name = f"call_log_{datetime.date.today().isoformat()}.csv"
+        default_path = os.path.join(os.path.expanduser("~"), "Desktop", default_name)
+        if not os.path.isdir(os.path.dirname(default_path)):
+            default_path = os.path.join(os.path.expanduser("~"), default_name)
+
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            self.t("ייצוא יומן שיחות", "Export Call Log"),
+            default_path,
+            "CSV (*.csv)")
+        if not path:
+            return
+        if not path.lower().endswith(".csv"):
+            path += ".csv"
+
+        ok = self._log.export_csv(path, self._direction, is_rtl)
+        if ok:
+            QMessageBox.information(
+                self, self.t("ייצוא הושלם", "Export Complete"),
+                self.t(f"היומן יוצא בהצלחה אל:\n{path}",
+                       f"Log exported successfully to:\n{path}"))
+        else:
+            QMessageBox.warning(
+                self, self.t("שגיאה", "Error"),
+                self.t("הייצוא נכשל. ודא שיש הרשאות כתיבה למיקום שנבחר.",
+                       "Export failed. Make sure you have write access to the chosen location."))
 
 
 class CallLogTab(QWidget, Translatable):
