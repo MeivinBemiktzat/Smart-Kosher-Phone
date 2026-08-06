@@ -3,3 +3,4 @@ bleak>=0.21.0
 sounddevice>=0.4.6
 vosk>=0.3.45
 SpeechRecognition>=3.10.0
+winsdk>=1.0.0b10; sys_platform == "win32"
