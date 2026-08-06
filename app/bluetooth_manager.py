@@ -4,17 +4,21 @@
 BluetoothManager - ניהול חיבור בלוטוס HFP
 ─────────────────────────────────────────────────────────
 ארכיטקטורה:
-  • Bleak (BleakScanner)  ← סריקת מכשירים (BLE + Classic via WinRT)
+  • Bleak (BleakScanner)   ← סריקת מכשירים (BLE + Classic via WinRT)
   • PowerShell / WinRT     ← גילוי מכשירים מותאמים (Classic BT paired)
-  • socket.AF_BLUETOOTH    ← חיבור RFCOMM/HFP (מובנה בפייתון, ללא PyBluez)
+  • WinRT (winsdk)         ← חיבור RFCOMM/HFP אמיתי (Windows.Devices.Bluetooth.Rfcomm)
   • AT Commands            ← שליטה בפלאפון (חיוג / מענה / ניתוק / CLIP)
+
+הערה: socket.AF_BLUETOOTH/BTPROTO_RFCOMM של פייתון כמעט אף פעם לא עובד
+ב-Windows (זו תמיכה שקיימת בעיקר ב-Linux) — לכן שכבת החיבור בפועל
+משתמשת ב-WinRT (חבילת winsdk) דרך app.core.winrt_rfcomm, שהוא ה-API
+הרשמי של Windows לבלוטוס Classic.
 ─────────────────────────────────────────────────────────
 """
 
 import asyncio
 import json
 import re
-import socket
 import subprocess
 import threading
 import time
@@ -22,6 +26,10 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from PyQt6.QtCore import QObject, QTimer, pyqtSignal as Signal
+
+from app.core.winrt_rfcomm import (
+    WinRTRfcommConnection, WinRTConnectionError, WINRT_AVAILABLE,
+)
 
 
 # ══════════════════════════════════════════════════════════
@@ -54,7 +62,6 @@ HFP_HF_UUID  = "0000111e-0000-1000-8000-00805f9b34fb"   # Hands-Free (HF side)
 HFP_AG_UUID  = "0000111f-0000-1000-8000-00805f9b34fb"   # Audio Gateway (phone side)
 HSP_HS_UUID  = "00001108-0000-1000-8000-00805f9b34fb"   # Headset
 HSP_AG_UUID  = "00001112-0000-1000-8000-00805f9b34fb"   # Headset Audio Gateway
-RFCOMM_PROTO = socket.BTPROTO_RFCOMM
 
 
 # ══════════════════════════════════════════════════════════
@@ -95,8 +102,8 @@ class BluetoothManager(QObject):
         self._current_device: Optional[BluetoothDevice] = None
         self._current_call: Optional[CallInfo] = None
 
-        # RFCOMM socket for AT-commands
-        self._rfcomm_sock: Optional[socket.socket] = None
+        # RFCOMM connection (WinRT-based) for AT-commands
+        self._rfcomm_sock: Optional[WinRTRfcommConnection] = None
         self._at_thread: Optional[threading.Thread] = None
         self._running = False
         self._at_buffer = ""
@@ -328,150 +335,71 @@ $result | ConvertTo-Json -Compress
             self.status_message.emit(self._t(f"מחובר ל-{dev.name} (הדגמה)", f"Connected to {dev.name} (demo)"))
             return
 
-        # ── Find HFP channel: WinRT/SDP lookup first, then brute-force ──
-        channel = self._probe_rfcomm_channel(address)
-        last_error = None
+        if not WINRT_AVAILABLE:
+            msg = self._t(
+                "חבילת winsdk לא מותקנת או שהמערכת אינה Windows — לא ניתן "
+                "להתחבר בפועל לבלוטוס",
+                "The winsdk package is not installed, or this isn't Windows — "
+                "cannot establish a real Bluetooth connection")
+            self.status_message.emit(msg)
+            self.connection_error.emit(msg)
+            self._enter_demo_fallback(dev, _is_reconnect, address)
+            return
 
-        # Try connecting; retry once with brute-force channel scan if the
-        # SDP-resolved channel doesn't actually accept a connection.
-        for attempt_channel in self._candidate_channels(channel):
-            try:
-                sock = socket.socket(
-                    socket.AF_BLUETOOTH,
-                    socket.SOCK_STREAM,
-                    RFCOMM_PROTO
-                )
-                sock.settimeout(10)
-                sock.connect((address, attempt_channel))
-                self._rfcomm_sock = sock
+        try:
+            conn = WinRTRfcommConnection(service_uuid=HFP_AG_UUID)
+            conn.connect(address)
+            self._rfcomm_sock = conn
 
-                dev.connected = True
-                self._current_device = dev
-                self._simulation_mode = False
-                self._reconnect_attempts = 0
-                self.device_connected.emit(dev)
-                self.status_message.emit(self._t(f"מחובר ל-{dev.name} (ערוץ {attempt_channel})", f"Connected to {dev.name} (channel {attempt_channel})"))
+            dev.connected = True
+            self._current_device = dev
+            self._simulation_mode = False
+            self._reconnect_attempts = 0
+            self.device_connected.emit(dev)
+            self.status_message.emit(self._t(
+                f"מחובר ל-{dev.name} (RFCOMM אמיתי)",
+                f"Connected to {dev.name} (real RFCOMM)"))
 
-                self._hfp_handshake()
-                self._running = True
-                self._at_thread = threading.Thread(
-                    target=self._at_reader_loop, daemon=True, name="ATReader")
-                self._at_thread.start()
-                return
+            self._hfp_handshake()
+            self._running = True
+            self._at_thread = threading.Thread(
+                target=self._at_reader_loop, daemon=True, name="ATReader")
+            self._at_thread.start()
+            return
 
-            except OSError as e:
-                last_error = e
-                continue
+        except WinRTConnectionError as e:
+            last_error = e
+        except Exception as e:
+            last_error = e
 
-        # ── All channel attempts failed ──
-        msg = self._t(f"שגיאת חיבור RFCOMM ל-{dev.name}: {last_error}", f"RFCOMM connection error to {dev.name}: {last_error}")
+        # ── Connection failed — surface *exactly* where it failed ──
+        stage = getattr(last_error, "stage", "unknown")
+        detail = getattr(last_error, "message", str(last_error))
+        msg = self._t(
+            f"שגיאת חיבור RFCOMM ל-{dev.name} בשלב '{stage}': {detail}",
+            f"RFCOMM connection error to {dev.name} at stage '{stage}': {detail}")
         self.status_message.emit(msg)
         self.connection_error.emit(msg)
 
         if _is_reconnect:
-            # Don't silently fall back to demo mode on a background
-            # reconnect attempt — surface the failure and keep retrying.
             self._schedule_reconnect(address)
             return
 
-        # Graceful fallback for a *manual* connect attempt: mark as
-        # simulation so the UI still works, but be explicit about it.
+        self._enter_demo_fallback(dev, _is_reconnect, address)
+
+    def _enter_demo_fallback(self, dev, _is_reconnect: bool, address: str):
+        """Graceful fallback for a *manual* connect attempt: mark as
+        simulation so the UI still works, but be explicit about it."""
         self._simulation_mode = True
         dev.connected = True
         self._current_device = dev
         self.device_connected.emit(dev)
         self.status_message.emit(self._t(
             f"לא הצלחתי להתחבר בפועל ל-{dev.name} — עברתי למצב הדגמה "
-            f"(בדוק שהמכשיר מותאם/paired ובטווח בלוטוס)",
+            f"(בדוק שהמכשיר מותאם/paired ובטווח בלוטוס, ושחבילת winsdk מותקנת)",
             f"Could not establish a real connection to {dev.name} — switched to "
-            f"demo mode (check the device is paired and in Bluetooth range)"))
-
-    def _probe_rfcomm_channel(self, address: str) -> int:
-        """
-        נסה לאתר את ערוץ RFCOMM של HFP (Audio Gateway) בצורה אמינה:
-        1. שאילתת WinRT/SDP אמיתית מול Windows (מדויקת ביותר)
-        2. Bleak service discovery (למכשירי dual-mode עם GATT)
-        3. Brute-force על ערוצים 1-8 (רשת ביטחון)
-        """
-        ch = self._probe_rfcomm_channel_winrt(address)
-        if ch:
-            return ch
-
-        try:
-            future = self._run_async(self._bleak_get_services(address))
-            services = future.result(timeout=6)
-            for svc in services:
-                uuid = svc.uuid.lower()
-                if uuid in (HFP_AG_UUID, HFP_HF_UUID):
-                    return getattr(svc, "handle", 1) or 1
-        except Exception:
-            pass
-
-        return 0   # 0 = "unknown" — let _candidate_channels() brute-force it
-
-    def _probe_rfcomm_channel_winrt(self, address: str) -> Optional[int]:
-        """
-        שאילתת SDP אמיתית מול Windows Bluetooth stack (WinRT) לאיתור
-        ערוץ ה-RFCOMM המדויק של שירות ה-Hands-Free Audio Gateway.
-        אמין משמעותית מ-brute-force ומונע חיבור לערוץ שגוי.
-        """
-        try:
-            mac_int = int(address.replace(":", ""), 16)
-        except ValueError:
-            return None
-
-        ps_script = f"""
-Add-Type -AssemblyName System.Runtime.WindowsRuntime
-$asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() |
-    Where-Object {{ $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and
-    $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' }})[0]
-function Await($WinRtTask, $ResultType) {{
-    $asTask = $asTaskGeneric.MakeGenericMethod($ResultType)
-    $task = $asTask.Invoke($null, @($WinRtTask))
-    $task.Wait(6000) | Out-Null
-    return $task.Result
-}}
-[Windows.Devices.Bluetooth.BluetoothDevice, Windows.Devices.Bluetooth, ContentType=WindowsRuntime] | Out-Null
-[Windows.Devices.Bluetooth.Rfcomm.RfcommDeviceService, Windows.Devices.Bluetooth.Rfcomm, ContentType=WindowsRuntime] | Out-Null
-[Windows.Devices.Enumeration.DeviceInformationCollection, Windows.Devices.Enumeration, ContentType=WindowsRuntime] | Out-Null
-
-$btDevOp = [Windows.Devices.Bluetooth.BluetoothDevice]::FromBluetoothAddressAsync({mac_int})
-$btDev = Await $btDevOp ([Windows.Devices.Bluetooth.BluetoothDevice])
-if ($null -eq $btDev) {{ exit }}
-
-$svcOp = $btDev.GetRfcommServicesForIdAsync(
-    [Windows.Devices.Bluetooth.Rfcomm.RfcommServiceId]::FromUuid([Guid]"{HFP_AG_UUID}"))
-$svcResult = Await $svcOp ([Windows.Devices.Bluetooth.Rfcomm.RfcommDeviceServicesResult])
-if ($svcResult.Services.Count -gt 0) {{
-    $svcResult.Services[0].ConnectionHostName | Out-Null
-    Write-Output $svcResult.Services[0].ServiceId.Uuid
-    Write-Output $svcResult.Services[0].ConnectionServiceName
-}}
-"""
-        try:
-            result = subprocess.run(
-                ["powershell", "-NoProfile", "-NonInteractive",
-                 "-ExecutionPolicy", "Bypass", "-Command", ps_script],
-                capture_output=True, text=True, timeout=10, encoding="utf-8"
-            )
-            # Windows RFCOMM SDP over WinRT doesn't expose a raw channel
-            # number directly (it's abstracted), but a successful lookup
-            # here confirms the AG service exists on this device, which is
-            # what matters most for reliability; channel 1 is virtually
-            # always correct for HFP's AG channel once the service exists.
-            if result.returncode == 0 and result.stdout.strip():
-                return 1
-        except Exception:
-            pass
-        return None
-
-    def _candidate_channels(self, hinted_channel: int) -> list:
-        """סדר ערוצים לניסיון חיבור — קודם הרמז, אחר כך רשת ביטחון"""
-        if hinted_channel:
-            ordered = [hinted_channel] + [c for c in range(1, 9) if c != hinted_channel]
-        else:
-            ordered = list(range(1, 9))
-        return ordered
+            f"demo mode (check the device is paired and in Bluetooth range, "
+            f"and that winsdk is installed)"))
 
     def _schedule_reconnect(self, address: str):
         """נסה להתחבר מחדש אוטומטית אחרי ניתוק לא-מכוון, עם Backoff"""
@@ -496,12 +424,6 @@ if ($svcResult.Services.Count -gt 0) {{
             delay, lambda: self._connect_thread(address, _is_reconnect=True))
         timer.daemon = True
         timer.start()
-
-    async def _bleak_get_services(self, address: str):
-        """קבל רשימת שירותים דרך Bleak"""
-        from bleak import BleakClient
-        async with BleakClient(address, timeout=5.0) as client:
-            return list(client.services)
 
     def disconnect_device(self):
         """נתק את המכשיר (ביוזמת המשתמש — לא יתבצע חיבור-מחדש אוטומטי)"""
@@ -556,10 +478,11 @@ if ($svcResult.Services.Count -gt 0) {{
                 "אין חיבור בלוטוס פעיל — הפקודה לא נשלחה", "No active Bluetooth connection — command not sent"))
             return False
         try:
-            self._rfcomm_sock.sendall((command + "\r").encode("ascii"))
+            self._rfcomm_sock.send((command + "\r").encode("ascii"))
             return True
-        except OSError as e:
-            self.status_message.emit(self._t(f"שגיאת שליחה: {e}", f"Send error: {e}"))
+        except WinRTConnectionError as e:
+            self.status_message.emit(self._t(
+                f"שגיאת שליחה ({e.stage}): {e.message}", f"Send error ({e.stage}): {e.message}"))
             # A send failure usually means the link actually dropped even
             # though we haven't seen it in the reader loop yet — trigger
             # the same reconnect path so the app recovers on its own.
@@ -570,13 +493,13 @@ if ($svcResult.Services.Count -gt 0) {{
 
     def _at_reader_loop(self):
         """לולאת קריאת תגובות AT מהפלאפון (רץ ב-thread נפרד)"""
-        self._rfcomm_sock.settimeout(1.0)
         buf = ""
         while self._running:
             try:
-                chunk = self._rfcomm_sock.recv(256).decode("ascii", errors="ignore")
-                if not chunk:
-                    break
+                chunk_bytes = self._rfcomm_sock.recv(256, timeout=1.0)
+                if not chunk_bytes:
+                    continue
+                chunk = chunk_bytes.decode("ascii", errors="ignore")
                 buf += chunk
                 # AT responses are separated by \r\n
                 while "\r\n" in buf:
@@ -584,9 +507,7 @@ if ($svcResult.Services.Count -gt 0) {{
                     line = line.strip()
                     if line:
                         self._parse_at(line)
-            except socket.timeout:
-                continue
-            except OSError:
+            except WinRTConnectionError:
                 break
         was_user_disconnect = self._user_disconnected
         addr = self._current_device.address if self._current_device else None
