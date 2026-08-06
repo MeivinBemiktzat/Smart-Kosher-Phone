@@ -5,12 +5,8 @@ name: Build & Release EXE
 #      לדוגמה: v1.0.0
 #
 #   2. ידנית — דרך הכפתור "Run workflow"
-#      במקרה כזה ייווצר Tag אוטומטי לפי תאריך ושעה.
-#
-# דוגמאות:
-#   v1.0.0
-#   v1.1.0
-#   v2026.08.05-2200
+#      במקרה של הרצה ידנית ייווצר Tag אוטומטי
+#      עבור ה-GitHub Release.
 
 on:
   push:
@@ -19,11 +15,7 @@ on:
 
   workflow_dispatch: {}
 
-# הרשאות:
-# contents: write מאפשר ל-Workflow:
-# - ליצור Tag
-# - ליצור Release
-# - להעלות קבצים ל-Release
+# נדרש כדי ליצור Tags ו-Releases ולהעלות אליהם קבצים
 permissions:
   contents: write
 
@@ -35,13 +27,13 @@ jobs:
     steps:
 
       # ============================================================
-      # 1. הורדת קוד הפרויקט
+      # 1. Checkout repository
       # ============================================================
       - name: Checkout repository
         uses: actions/checkout@v4
 
       # ============================================================
-      # 2. התקנת Python
+      # 2. Set up Python
       # ============================================================
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -49,7 +41,7 @@ jobs:
           python-version: "3.11"
 
       # ============================================================
-      # 3. התקנת תלויות
+      # 3. Install dependencies
       # ============================================================
       - name: Install dependencies
         shell: pwsh
@@ -59,19 +51,16 @@ jobs:
           pip install pyinstaller
 
       # ============================================================
-      # 4. קביעת Tag עבור ה-Release
+      # 4. Determine Release Tag
       #
-      # אם ההרצה הופעלה באמצעות Tag קיים:
-      #     משתמשים ב-Tag הקיים.
-      #
-      # לדוגמה:
-      #     v1.0.0
+      # אם ההרצה הופעלה באמצעות Tag:
+      #   משתמשים ב-Tag הקיים.
       #
       # אם ההרצה הופעלה ידנית:
-      #     יוצרים Tag אוטומטי.
+      #   נוצר Tag אוטומטי לפי תאריך ושעה.
       #
       # לדוגמה:
-      #     v2026.08.05-2200
+      #   v2026.08.05-2200
       # ============================================================
       - name: Determine release tag
         id: release_tag
@@ -88,23 +77,25 @@ jobs:
               Write-Host "Generated release tag: $tag"
           }
 
-          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "tag=$tag" | Out-File `
+            -FilePath $env:GITHUB_OUTPUT `
+            -Encoding utf8 `
+            -Append
 
       # ============================================================
-      # 5. Build של קובץ ה-EXE
+      # 5. Build EXE with PyInstaller
       #
-      # התיקון החשוב:
+      # התיקון החשוב ל-Vosk:
       #
-      # --collect-all vosk
+      #   --collect-all vosk
       #
-      # פעולה זו גורמת ל-PyInstaller לאסוף את כל רכיבי Vosk,
-      # כולל קבצים בינאריים, data ו-imports הנדרשים.
+      # בנוסף נשמר:
+      #   --hidden-import vosk
       #
-      # זה פותר את הבעיה שבה Vosk חיפש:
+      # ונוסף גם:
+      #   --hidden-import winsdk
       #
-      # _MEIxxxxx\vosk
-      #
-      # ולא מצא את התיקייה/הקבצים הנדרשים בזמן הרצת ה-EXE.
+      # כפי שהיה בקובץ שה-AI שלך יצר.
       # ============================================================
       - name: Build EXE with PyInstaller
         shell: pwsh
@@ -118,6 +109,7 @@ jobs:
             --hidden-import bleak.backends.winrt `
             --hidden-import bleak.backends.winrt.scanner `
             --hidden-import bleak.backends.winrt.client `
+            --hidden-import winsdk `
             --hidden-import vosk `
             --hidden-import sounddevice `
             --hidden-import PyQt6.QtMultimedia `
@@ -126,7 +118,7 @@ jobs:
             main.py
 
       # ============================================================
-      # 6. בדיקת Build
+      # 6. Verify build output
       # ============================================================
       - name: Verify build output
         shell: pwsh
@@ -144,9 +136,9 @@ jobs:
           Get-ChildItem "dist" | Format-Table Name, Length, LastWriteTime
 
       # ============================================================
-      # 7. העלאת EXE כ-Artifact
+      # 7. Upload build artifact
       #
-      # ה-EXE נשמר גם בתוך הרצת ה-GitHub Actions.
+      # הקובץ נשמר גם כ-Artifact של GitHub Actions.
       # ============================================================
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
@@ -156,15 +148,15 @@ jobs:
           if-no-files-found: error
 
       # ============================================================
-      # 8. יצירת GitHub Release והעלאת ה-EXE
+      # 8. Publish to GitHub Release
       #
-      # אם קיים Tag:
-      #     משתמשים בו.
+      # במקרה של Tag קיים:
+      #   משתמשים ב-Tag הקיים.
       #
-      # אם ההרצה ידנית:
-      #     משתמשים ב-Tag האוטומטי שנוצר בשלב הקודם.
+      # במקרה של Run workflow:
+      #   משתמשים ב-Tag שנוצר בשלב Determine release tag.
       #
-      # הקובץ dist/SmartKosherPhone.exe מועלה ישירות ל-Release.
+      # ה-EXE מועלה ישירות ל-Release.
       # ============================================================
       - name: Publish to GitHub Release
         uses: softprops/action-gh-release@v2
